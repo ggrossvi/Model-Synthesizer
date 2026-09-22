@@ -1,0 +1,17 @@
+# --- Streamlit & Secrets ---
+.streamlit/
+.env
+
+# --- Python Environment & Caching ---
+.venv/
+env/
+venv/
+ENV/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Operating System Clutter ---
+.DS_Store
+Thumbs.db
