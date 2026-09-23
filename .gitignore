@@ -1,6 +1,7 @@
 # --- Streamlit & Secrets ---
 .streamlit/secrets.toml
 .env
+exports/
 
 # --- Python Environment & Caching ---
 .venv/
