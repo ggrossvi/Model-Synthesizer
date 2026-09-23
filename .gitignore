@@ -1,5 +1,5 @@
 # --- Streamlit & Secrets ---
-.streamlit/
+.streamlit/secrets.toml
 .env
 
 # --- Python Environment & Caching ---
