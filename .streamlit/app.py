@@ -11,6 +11,7 @@ from google import genai
 openai_api_key = st.secrets.get("OPENAI_API_KEY", None)
 anthropic_api_key = st.secrets.get("ANTHROPIC_API_KEY", None)
 REQUEST_TIMEOUT_SECONDS = 30.0
+GEMINI_TOTAL_TIMEOUT_SECONDS = 35.0
 EXPORTS_DIR = Path(__file__).resolve().parent.parent / "exports"
 
 # 2. Helper Functions: Token Counting & Costs
@@ -107,8 +108,12 @@ async def get_gemini_response(prompt, model, temp):
 
         candidate_models = [model, "gemini-3.6-flash", "gemini-2.5-flash"]
         last_error = None
+        deadline = started_at + GEMINI_TOTAL_TIMEOUT_SECONDS
 
         for candidate_model in dict.fromkeys(candidate_models):
+            if time.perf_counter() >= deadline:
+                break
+
             def send_message():
                 chat = gemini_client.chats.create(model=candidate_model)
                 return chat.send_message(
@@ -117,10 +122,15 @@ async def get_gemini_response(prompt, model, temp):
                 )
 
             for attempt in range(3):
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    elapsed = time.perf_counter() - started_at
+                    return f"⚠️ Model Offline (Error: TimeoutError: exceeded {GEMINI_TOTAL_TIMEOUT_SECONDS:.0f}s total Gemini budget)", 0.0, elapsed
+
                 try:
                     response = await asyncio.wait_for(
                         loop.run_in_executor(None, send_message),
-                        timeout=REQUEST_TIMEOUT_SECONDS
+                        timeout=min(REQUEST_TIMEOUT_SECONDS, remaining)
                     )
                     ans = response.text or ""
                     elapsed = time.perf_counter() - started_at
@@ -136,7 +146,9 @@ async def get_gemini_response(prompt, model, temp):
                     # Retry transient capacity/rate failures before giving up.
                     transient = isinstance(e, asyncio.TimeoutError) or any(token in message for token in ["UNAVAILABLE", "503", "RESOURCE_EXHAUSTED", "429"])
                     if transient and attempt < 2:
-                        await asyncio.sleep(1.0 * (attempt + 1))
+                        sleep_time = min(1.0 * (attempt + 1), max(0.0, deadline - time.perf_counter()))
+                        if sleep_time > 0:
+                            await asyncio.sleep(sleep_time)
                         continue
 
                     # For non-transient errors, fail immediately.
@@ -152,9 +164,9 @@ async def get_gemini_response(prompt, model, temp):
 
 async def get_all_responses(prompt, temp, use_openai, use_anthropic, use_gemini):
     responses = {
-        "openai": ("⏭️ Skipped (disabled in sidebar)", 0.0),
-        "anthropic": ("⏭️ Skipped (disabled in sidebar)", 0.0),
-        "gemini": ("⏭️ Skipped (disabled in sidebar)", 0.0),
+        "openai": ("⏭️ Skipped (disabled in sidebar)", 0.0, 0.0),
+        "anthropic": ("⏭️ Skipped (disabled in sidebar)", 0.0, 0.0),
+        "gemini": ("⏭️ Skipped (disabled in sidebar)", 0.0, 0.0),
     }
 
     task_map = {}
@@ -186,6 +198,7 @@ def save_markdown_export(file_name: str, content: str) -> Path:
 
 def build_history_markdown(history_items) -> str:
     md_content = "# 🤖 AI Aggregator History Export\n\n"
+    export_total_cost = 0.0
     for i, item in enumerate(history_items, 1):
         md_content += f"## Query {i}: {item['prompt']}\n\n"
         if item['synthesis']:
@@ -199,7 +212,11 @@ def build_history_markdown(history_items) -> str:
         md_content += f"  * Time: {item.get('raw_gemini_time', 0.0):.2f}s\n\n"
         if item.get('synthesis_time') is not None:
             md_content += f"### ⏱️ Synthesis Time\n{item.get('synthesis_time', 0.0):.2f}s\n\n"
+        if item.get('total_cost') is not None:
+            md_content += f"### 💵 Query Total Cost\n${item.get('total_cost', 0.0):.5f}\n\n"
+            export_total_cost += item.get('total_cost', 0.0)
         md_content += f"---\n\n"
+    md_content += f"## Session Total Cost\n${export_total_cost:.5f}\n"
     return md_content
 
 # 4. App Workspace Setup
@@ -292,11 +309,11 @@ if st.button("Fetch Responses", type="primary"):
                     synth_started_at = time.perf_counter()
                     # Pick the first available enabled provider for synthesis.
                     if use_anthropic and model_success(ans_a):
-                        best_answer, cost_synth = asyncio.run(get_anthropic_response(synthesis_prompt, "claude-3-5-sonnet-latest", 0.2))
+                        best_answer, cost_synth, _synth_model_time = asyncio.run(get_anthropic_response(synthesis_prompt, "claude-3-5-sonnet-latest", 0.2))
                     elif use_openai and model_success(ans_o):
-                        best_answer, cost_synth = asyncio.run(get_openai_response(synthesis_prompt, "gpt-4o", 0.2))
+                        best_answer, cost_synth, _synth_model_time = asyncio.run(get_openai_response(synthesis_prompt, "gpt-4o", 0.2))
                     elif use_gemini and model_success(ans_g):
-                        best_answer, cost_synth = asyncio.run(get_gemini_response(synthesis_prompt, "gemini-3.6-flash", 0.2))
+                        best_answer, cost_synth, _synth_model_time = asyncio.run(get_gemini_response(synthesis_prompt, "gemini-3.6-flash", 0.2))
                     else:
                         best_answer = "❌ Synthesis unavailable: no enabled model returned a successful response."
                         st.error(best_answer)
@@ -339,6 +356,7 @@ if st.button("Fetch Responses", type="primary"):
             "prompt": user_input,
             "synthesis": best_answer if run_synthesis else None,
             "synthesis_time": synthesis_time,
+            "total_cost": query_total,
             "raw_openai": ans_o,
             "raw_openai_time": time_o,
             "raw_anthropic": ans_a,
